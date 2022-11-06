@@ -59,17 +59,20 @@ def main():
 
     classes = load_classes(names_file)
 
+
+    # Prepare images
     try:
         img_list = [osp.join(osp.realpath('.'), im_dir, img) for img in os.listdir(im_dir)]
     except Exception:
         print("Image dir not found")
         return 
 
-    # Prepare images
     images = [cv2.imread(img) for img in img_list]
     inp_dim = 608 # TODO
     prepped_images = [prep_image(img, inp_dim) for img in images]
 
+
+    # Main loop
     final_results = []
     for idx in range(len(prepped_images)):
         # Images in question
@@ -95,6 +98,7 @@ def main():
         output[:, 4] = torch.clamp(output[:, 4], min=10, max=orig_h - 10)
 
         final_results.append(draw_bboxs(real_image, output, classes))
+    
     
     # Save images with bboxes 
     for idx in range(len(final_results)):
