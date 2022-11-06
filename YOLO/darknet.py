@@ -1,14 +1,12 @@
 import torch 
 import torch.nn as nn
-import torch.nn.functional as F 
-from torch.autograd import Variable
 import numpy as np
 from util import * 
 
 
 def parse_cfg(cfgfile):
     """
-    Takes a configuration file
+    Takes a configuration file from the yolov3 authors
     
     Returns a list of blocks. Each blocks describes a block in the neural
     network to be built. Block is represented as a dictionary in the list
@@ -53,7 +51,7 @@ def create_modules(blocks):
     output_filters = []                 # Helps us keep track of concatenated filter sizes 
                                         # of previous layers brought in by [route] module
                                         # Add to this list so we know the output dimensions per layer
-                                        # To be used in the forward function of the network
+                                        # which is used to construct our conv layer dimensions
     
     # Parse (Darknet) config file
     for idx, block in enumerate(blocks[1:]):
@@ -65,16 +63,16 @@ def create_modules(blocks):
 
         # Upsampling layer always upsample with stride 2 and bilinearly
         elif block["type"] == "upsample":
-            stride = int(block["stride"]) 
-            upsample = nn.Upsample(scale_factor=stride, mode="nearest") 
+            stride = int(block["stride"])           # in cfg this is always 2
+            upsample = nn.Upsample(scale_factor=stride, mode="bilinear") 
             module.add_module("upsample_{}".format(idx), upsample)
         
-        # Route layer is a layer where we concat the specified layers output or just route the specified 
-        # layers' output to the next layer
+        # Route layer is a layer where we concat the specified layers output (or just route the specified 
+        # layers' output) to the next layer
         elif block["type"] == "route":
             filters, module = parse_route(output_filters, idx, block)
         
-        # Shortcut layer is a layer where we add the specified layers output to last layers output
+        # Shortcut layer is a layer where we add the specified layers output to last layers' output
         elif block["type"] == "shortcut":
             shortcut_layer = int(block["from"])
             module.add_module("shortcut_{}".format(idx), ShortcutLayer(shortcut_layer))
@@ -97,10 +95,11 @@ def parse_conv(nr_filters, idx, block):
     module = nn.Sequential()
 
     # Parse params for conv layer
-    # Batch_norm present
+    # Batch_norm present means we add do not need a bias (by definition of batch norm)
     try: 
         batch_norm = int(block["batch_normalize"])
         bias = False
+
     except:
         batch_norm = 0
         bias = True
@@ -159,7 +158,8 @@ def parse_route(output_filters, idx, block):
 def parse_yolo(idx, block, net_info):
     module = nn.Sequential()
 
-    mask = [int(x) for x in block["mask"].split(',')]   # used to determine with anchors to take
+    # Anchor processing
+    mask = [int(x) for x in block["mask"].split(',')]           # used to determine which anchors to take
     anchors = [int(x) for x in block["anchors"].split(',')]
     anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
     anchors = [anchors[i] for i in mask]
@@ -186,7 +186,7 @@ class Darknet(nn.Module):
         self.net_info, self.module_list, self.filters  = create_modules(self.blocks)
 
     
-    def forward(self, x, CUDA):
+    def forward(self, x):
         """
         Iterate over blocks (modules) and perform forward pass
         """

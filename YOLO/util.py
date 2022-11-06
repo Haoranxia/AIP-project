@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import numpy as np
 
 """
 File containing utility functions and custom layers
@@ -83,9 +82,9 @@ class DetectionLayer(nn.Module):
     def forward(self, x):
         """
         Outputs a tensor containing:
-        - 0 or 1 whether obj has been detection
+        - probability of whether obj has been detected
         - bbox attributes
-        - class predictions
+        - class predictions probabilities
         """
         predictions = self.predict_cells(x, self.input_dim, self.num_classes)
         return predictions
@@ -105,6 +104,8 @@ class DetectionLayer(nn.Module):
         input_dim:      (H, W) of input image
         num_classes:    nr. of classes to detect
         """
+        
+        # We assume x.size(2) == x.size(3)
         stride = input_dim[0] // x.size(2)          # Our feature maps are [x.size(2) * x.size(3)]
                                                     # Each of these feature map cells has a receptive field encompassing
                                                     # a portion of the input. We use this receptive field to define our
@@ -112,7 +113,7 @@ class DetectionLayer(nn.Module):
 
         grid_size = input_dim[0] // stride          # Size of each grid. The nr of grids we have is input dimensions / stride
 
-        bbox_attributes = 5 + num_classes           # Obj detected, x, y, w, h, num_classes => 5 + num_classes
+        bbox_attributes = 5 + num_classes           # Obj detected, x, y, w, h, P_obj, num_classes => 5 + num_classes
         num_anchors = len(self.anchors)
         batch_size = x.size(0)
 
@@ -124,14 +125,14 @@ class DetectionLayer(nn.Module):
         x = x.transpose(1, 2).contiguous()
 
         # Reshape to get desired result of (B, c*c*anchors, b*(5+c)) since we want
-        # the bbox attributes to be in the last dimension
+        # the bbox attributes only to be in the last dimension
         x = x.view(batch_size, grid_size * grid_size * num_anchors, bbox_attributes)
 
         # Rescale anchors so they fit into the cell
         anchors = [(anchor[0] / stride, anchor[1] / stride) for anchor in self.anchors]
 
         # Sigmoid (x,y) coords and obj confidence
-        # Note output per cell y = [bbox params + object confidence + class confidences] [4 + 1 + num_classes]
+        # Note output per cell y = [bbox params + object confidence + class confidences] = [4 + 1 + num_classes]
         # By definition yolov3 predicts sigmoid(x) sigmoid(y) as output
         x[:, :, 0] = torch.sigmoid(x[:, :, 0])
         x[:, :, 1] = torch.sigmoid(x[:, :, 1])
@@ -140,7 +141,8 @@ class DetectionLayer(nn.Module):
         # Evenly spaced values [0, grid_size) of 2d coordinates (x,y)
         grid = torch.arange(grid_size)
         
-        # Compute offsets for bounding box (x,y) coordinates
+        # Compute offsets for bounding box (x,y) coordinates. Compute correct coordinates
+        # for each bbox in terms of the grid_cell it belongs to
         offsets = torch.FloatTensor([[b, a] for a in grid for b in grid])
 
         # Repeat for each anchor box and reshape it into desired output
@@ -160,7 +162,7 @@ class DetectionLayer(nn.Module):
         # yolov3 predicts exp(w), exp(h) for bbox w,h
         x[:, :, 2:4] = anchors * torch.exp(x[:, :, 2:4])
 
-        # Softmax the class prediction scores
+        # Sigmoid class prediction scores
         x[:, :, 5:5 + num_classes] = torch.sigmoid((x[:, :, 5:5 + num_classes]))
 
         # Resize YOLO detection map outputs to size of input image
@@ -227,12 +229,6 @@ def format_output(prediction, confidence=0.5, nms_conf=0.5):
             matching_predictions = image_prediction[class_mask, :]   # result: filtered tensor of size (matching_classes, 5 + num_classes)
             # matching_confidences = confidences[class_mask, :]        # result: filtered tensor of size (matching_classes, 3)
 
-            # # Sort matching confidences by class
-            # sorted_indices = torch.sort(matching_confidences[:, 0], descending=True)[1]
-
-            # # Re-index matching predictions to match sorted confidences
-            # matching_predictions = torch.index_select(matching_predictions, 0, sorted_indices)
-            
             sorted_idxs = torch.sort(matching_predictions[:, 5 + class_idx], descending=True)[1]
             matching_predictions = torch.index_select(matching_predictions, 0, sorted_idxs)
 
@@ -265,12 +261,14 @@ def format_output(prediction, confidence=0.5, nms_conf=0.5):
 
 def non_max_suppression(matching_predictions, nms_conf=0.5):
     """
-    nms_conf:       Confidence threshold for non max suppression
+    matching_predictions:   2D Tensor of (nr_bboxs, bbox_params)
+    nms_conf:               Confidence threshold for non max suppression
     
-    return:         Tensor with non suppressed bboxes for class 'class_idx'
+    return:                 Tensor with non suppressed bboxes for class 'class_idx'
     """
-    # Loop over sorted indices (highest conf to lowest) and compute IoUs of highest conf. bbox
-    # and all other bboxs. Then remove bboxs with IoU > threshshold
+    
+    # Loop over (sorted) bounding boxes by class confidence and perform
+    # non max suppression
     nr_bboxes = matching_predictions.size(0)
     for idx in range(nr_bboxes):
         try:
@@ -299,7 +297,8 @@ def non_max_suppression(matching_predictions, nms_conf=0.5):
         # Get rid of extra dimension created by mask
         matching_predictions = torch.squeeze(matching_predictions)
 
-    # Output should be a 2D tensor (nr_bbox, bbox_attrib)
+    # Output should be a 2D tensor (nr_bbox, bbox_attrib) but due to torch.squeeze(matching_predictions)
+    # we have an edge case where if there is only 1 bbox we return the wrong dimension
     try:
         _ = matching_predictions.size(1)
         return matching_predictions
@@ -325,10 +324,10 @@ def bbox_IoU(box1, box2):
     inter_rect_x2 =  torch.min(box1[:, 2], box2[:, 2])
     inter_rect_y2 =  torch.min(box1[:, 3], box2[:, 3])
     
-    #Intersection area
+    #Intersection area. We clamp it in case we have negative area
     inter_area = torch.clamp(inter_rect_x2 - inter_rect_x1 + 1, min=0) * torch.clamp(inter_rect_y2 - inter_rect_y1 + 1, min=0)
 
-    #Union Area
+    #Union Areas
     box1_area = (box1[:, 2] - box1[:, 0] + 1) * (box1[:, 3] - box1[:, 1] + 1)
     box2_area = (box2[:, 2] - box2[:, 0] + 1) * (box2[:, 3] - box2[:, 1] + 1)
     
@@ -343,96 +342,3 @@ def load_classes(names_file):
     fp = open(names_file, "r")
     names = fp.read().split("\n")
     return names
-
-
-"""
-MISC Code for possible later use
-"""
-### Code for nms attempt 1
-    # # Obtain indices of bbox's that match our class_idx
-    # matching_classes = confidences[confidences[:, 1] == class_idx]
-    # print("match class size: ", matching_classes.size())
-    # print("indices:", matching_classes)
-
-    # # Find maximum confidence in matching confidences
-    # max_confidence_idx = torch.argmax(matching_classes[:, 0])
-    
-    # # For every other bbox of same class suppress it if there is a high IoU
-    # non_suppressed_bboxs = bboxs[:,  max_confidence_idx, :]
-    # print("non suppr size: ", non_suppressed_bboxs.size())
-    # print("non suppr: ", non_suppressed_bboxs)
-
-    # highest_conf_bbox = matching_classes[max_confidence_idx]
-
-    # # Perform NMS between highest_conf_bbox and every other bbox of same class
-    # for idx in range(matching_classes.size(0)):
-    #     other_bbox = matching_classes[idx]
-
-    #     # We are checking the same bbox as the max confidence bbox
-    #     if other_bbox[2] == max_confidence_idx:
-    #         continue
-        
-    #     # Find IoU between highest conf bbox and other bboxs of same class
-    #     iou = bbox_IoU(bboxs[:, max_confidence_idx, :], bboxs[:, idx, :])
-
-    #     # Don't suppress if iou is acceptable
-    #     if (iou < nms_conf):
-    #         non_suppressed_bboxs = torch.cat((non_suppressed_bboxs, bboxs[:, idx, :]))
-
-    # return non_suppressed_bboxs
-
-
-### Code for nms attempt 2
-# # Find highest confidence detection for specified class
-    # highest_conf_prediction_idx = torch.argmax(matching_confidences[:, 0])
-    # highest_conf_prediction = matching_predictions[highest_conf_prediction_idx]
-
-    # # Remove highest conf prediction from matching tensors
-    # matching_predictions = torch.cat(matching_predictions[:highest_conf_prediction_idx], matching_predictions[highest_conf_prediction_idx:])
-    # matching_confidences = torch.cat(matching_confidences[:highest_conf_prediction_idx], matching_confidences[highest_conf_prediction_idx:])
-
-    # # Add highest confidence prediction to final output
-    # final_output = torch.Tensor(highest_conf_prediction)
-
-    # # For every other detecetion for our class perform NMS with current_bbox
-    # while matching_predictions.numel() > 0:
-
-    #     # Iterate over all (remaining) matching predictions
-    #     for idx in range(matching_predictions.size(0)):
-    #         bbox1 = matching_predictions[highest_conf_prediction_idx]
-    #         bbox2 = matching_predictions[idx]
-    #         iou = bbox_IoU(bbox1, bbox2) 
-
-    #         # If iou is above threshold we remove from the matching tensors
-    #         # they can be suppressed
-    #         if (iou > nms_conf):
-    #             matching_predictions = torch.cat(matching_predictions[:, :idx], matching_predictions[:, idx:])
-    #             matching_confidences = torch.cat(matching_confidences[:, :idx], matching_confidences[:, idx:])
-        
-    #     # Assign new prediction to current highest conf prediction and repeat
-    #     highest_conf_prediction_idx = torch.argmax(matching_confidences[:, 0])
-    #     highest_conf_prediction = matching_predictions[highest_conf_prediction_idx]
-    #     final_output = torch.cat((final_output, highest_conf_prediction), 1)
-
-    # return final_output
-
-
-
-
-
-        
-
-
-        
-
-
-
-    
-    
-
-
-
-
-
-
-
