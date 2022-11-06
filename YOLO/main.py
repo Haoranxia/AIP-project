@@ -72,7 +72,7 @@ def main():
     classes = load_classes(names_file)
 
     # Image path
-    im_dir = "../data/testing_images"
+    im_dir = "../data/testing_images/"
 
     try:
         img_list = [osp.join(osp.realpath('.'), im_dir, img) for img in os.listdir(im_dir)]
@@ -101,6 +101,12 @@ def main():
         output[:, 2] *= scale_h
         output[:, 3] *= scale_w 
         output[:, 4] *= scale_h
+
+        # Clip boxes so it stays within the image
+        output[:, 1] = torch.clamp(output[:, 1], min=25, max=orig_w - 10)
+        output[:, 2] = torch.clamp(output[:, 2], min=25, max=orig_h - 10)
+        output[:, 3] = torch.clamp(output[:, 3], min=10, max=orig_w - 10)
+        output[:, 4] = torch.clamp(output[:, 4], min=10, max=orig_h - 10)
 
         final_results.append(draw_bboxs(real_image, output, classes))
     

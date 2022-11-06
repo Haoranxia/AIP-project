@@ -165,11 +165,7 @@ class DetectionLayer(nn.Module):
 
         # Resize YOLO detection map outputs to size of input image
         x[:, :, :4] *= stride
-
-        # Note that for ground truth comparison we should invert the prediction format for
-        # the bbox (x,y) and (w,h) 
-        # x, y = sigmoid_inverse(x, y)
-        # w, h = ln(w, h) 
+        
         return x
 
 
@@ -193,9 +189,8 @@ def format_output(prediction, confidence=0.5, nms_conf=0.5):
     bounding_boxes[:, :, 1] = prediction[:, :, 1] - (prediction[:, :, 3] / 2)
     bounding_boxes[:, :, 2] = prediction[:, :, 0] + (prediction[:, :, 2] / 2)
     bounding_boxes[:, :, 3] = prediction[:, :, 1] + (prediction[:, :, 3] / 2)
-    prediction[:, :, :4] = bounding_boxes[:, :, :4]
+    prediction[:, :, :4] = bounding_boxes[:, :, :4]                    
     
-    # Output dictionary of {class_idx : bbox (x1, y1, x2, y2)}
     output = None
 
     # For every image (in our batch) find final bbox's
@@ -218,44 +213,46 @@ def format_output(prediction, confidence=0.5, nms_conf=0.5):
 
         # Concat idx to confidence 
         idx_tensor = torch.Tensor([i for i in range(image_prediction.size(0))]).unsqueeze(1)
-        confidences = torch.cat((confidences[:, :], idx_tensor), 1)
+        confidences = torch.cat((confidences, idx_tensor), 1)
         
         # Unique classes identified by detector: 1D Tensor
         unique_classes = torch.unique(max_conf_indices)
 
         # For each unique class retain perform NMS
-        for class_idx in unique_classes:  
-            print("\n class: ", class_idx)
-            
+        for class_idx in unique_classes:        
             # Construct mask to filter through predictions which dont match our class
             class_mask = (confidences[:, 1] == class_idx)
 
             # Apply mask
             matching_predictions = image_prediction[class_mask, :]   # result: filtered tensor of size (matching_classes, 5 + num_classes)
-            matching_confidences = confidences[class_mask, :]        # result: filtered tensor of size (matching_classes, 3)
+            # matching_confidences = confidences[class_mask, :]        # result: filtered tensor of size (matching_classes, 3)
 
-            # Sort matching confidences by class
-            sorted_indices = torch.sort(matching_confidences[:, 0], descending=True)[1]
+            # # Sort matching confidences by class
+            # sorted_indices = torch.sort(matching_confidences[:, 0], descending=True)[1]
 
-            # Re-index matching predictions to match sorted confidences
-            matching_predictions = torch.index_select(matching_predictions, 0, sorted_indices)
-
-            print("pre nms size: ", matching_predictions.size())
-            # Output of nms for this specific class
-            matching_predictions = non_max_suppression(matching_predictions, nms_conf)
-
-            print("post nms size: ", matching_predictions.size())
+            # # Re-index matching predictions to match sorted confidences
+            # matching_predictions = torch.index_select(matching_predictions, 0, sorted_indices)
             
-            # Get rid of extra dimension 1
-            matching_predictions = torch.squeeze(matching_predictions, dim=1)
+            sorted_idxs = torch.sort(matching_predictions[:, 5 + class_idx], descending=True)[1]
+            matching_predictions = torch.index_select(matching_predictions, 0, sorted_idxs)
+
+            # Output of nms for this specific class
+            matching_predictions = non_max_suppression(matching_predictions[:, :4], nms_conf)
+
+            # Add additional dimension for output formatting
+            # matching_predictions = torch.unsqueeze(matching_predictions, dim=1)
 
             # Prepare tensor of batch indices to concat to our predictions
             batch_idxs = torch.Tensor([idx for _ in range(matching_predictions.size(0))])
             batch_idxs = torch.unsqueeze(batch_idxs, 1)
 
+            # Same for class indices
             class_idxs = torch.Tensor([class_idx for _ in range(matching_predictions.size(0))])
             class_idxs = torch.unsqueeze(class_idxs, 1)         
 
+            # print(batch_idxs.size(), matching_predictions.size(), class_idxs.size())
+
+            # Concat predictions together
             if output is None:
                 output = torch.cat((batch_idxs, matching_predictions, class_idxs), 1)
 
@@ -274,32 +271,43 @@ def non_max_suppression(matching_predictions, nms_conf=0.5):
     """
     # Loop over sorted indices (highest conf to lowest) and compute IoUs of highest conf. bbox
     # and all other bboxs. Then remove bboxs with IoU > threshshold
-    for idx in range(matching_predictions.size(0)):
-        #print("idx: ", idx, " - BEFORE matching pred size: ", matching_predictions.size())
+    nr_bboxes = matching_predictions.size(0)
+    for idx in range(nr_bboxes):
         try:
             # Compute IoU of highest conf. box and all other boxes
             IoUs = bbox_IoU(matching_predictions[idx].unsqueeze(0), matching_predictions[idx + 1:])
         
-        except Exception:
+        except Exception as e:
             # idx + 1 went out of bounds so we done
-            #print("breaking size: ", matching_predictions.size())
+            # print(e)
+            # print("breaking size: ", matching_predictions.size())
             break
 
         # Zero mask all detections that have IoU > threshold
         # If iou < conf then we keep the bbox, else we remove it (mask it)
-        print("IoUs: ", IoUs)
-        mask = (IoUs < nms_conf)
-        print("masks: ", mask)
-        mask = mask.unsqueeze(1)
-        print("masks unsqueezed: ", mask)
-        matching_predictions[idx + 1:] *= mask
-        print("matching pred: ", matching_predictions.size())
-        
-        # Remove zeroed (masked) entries and only return bounding boxes
-        non_zero_indices = torch.nonzero(matching_predictions[:, 4])
-        matching_predictions = matching_predictions[non_zero_indices, :4]
+        mask = (IoUs < nms_conf) 
 
-    return matching_predictions
+        # Make sure the mask matches the dimensions for matching_predictions
+        mask = mask.unsqueeze(1)
+        matching_predictions[idx + 1:] *= mask
+
+        # Remove zeroed (masked) entries (find indices that are nonzero)
+        summed_predictions = torch.sum(matching_predictions, dim=1)
+        indices = torch.nonzero(summed_predictions)
+        matching_predictions = matching_predictions[indices]
+
+        # Get rid of extra dimension created by mask
+        matching_predictions = torch.squeeze(matching_predictions)
+
+    # Output should be a 2D tensor (nr_bbox, bbox_attrib)
+    try:
+        _ = matching_predictions.size(1)
+        return matching_predictions
+
+    # Output is only 1 bbox so we need to add a dimension
+    except:
+        matching_predictions = torch.unsqueeze(matching_predictions, 0)
+        return matching_predictions
 
 
 def bbox_IoU(box1, box2):
