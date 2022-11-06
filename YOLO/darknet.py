@@ -47,7 +47,7 @@ def create_modules(blocks):
 
     module_list = nn.ModuleList()       # List of modules we add to
 
-    nr_filters = 3                      # Input has 3 channels (rgb)
+    prev_filters = 3                    # Input has 3 channels (rgb)
                                         # to be used as depth for next layers' filters
 
     output_filters = []                 # Helps us keep track of concatenated filter sizes 
@@ -61,23 +61,22 @@ def create_modules(blocks):
 
         # Conv layer     
         if block["type"] == "convolutional":
-            nr_filters, module = parse_conv(nr_filters, idx, block)
+            filters, module = parse_conv(prev_filters, idx, block)
 
         # Upsampling layer always upsample with stride 2 and bilinearly
         elif block["type"] == "upsample":
             stride = int(block["stride"]) 
-            upsample = nn.Upsample(scale_factor=stride, mode="bilinear") 
+            upsample = nn.Upsample(scale_factor=stride, mode="nearest") 
             module.add_module("upsample_{}".format(idx), upsample)
         
         # Route layer is a layer where we concat the specified layers output or just route the specified 
         # layers' output to the next layer
         elif block["type"] == "route":
-            nr_filters, module = parse_route(output_filters, idx, block)
+            filters, module = parse_route(output_filters, idx, block)
         
         # Shortcut layer is a layer where we add the specified layers output to last layers output
         elif block["type"] == "shortcut":
             shortcut_layer = int(block["from"])
-            nr_filters = output_filters[shortcut_layer]
             module.add_module("shortcut_{}".format(idx), ShortcutLayer(shortcut_layer))
         
         # YOLO (Detection) layer
@@ -85,7 +84,8 @@ def create_modules(blocks):
             module = parse_yolo(idx, block, net_info)
 
         module_list.append(module)
-        output_filters.append(nr_filters)
+        output_filters.append(filters)
+        prev_filters = filters
 
     return net_info, module_list, output_filters
 
@@ -98,18 +98,15 @@ def parse_conv(nr_filters, idx, block):
 
     # Parse params for conv layer
     # Batch_norm present
-    try:
-        batch_norm, filters, size, stride, pad = \
-            bool(block["batch_normalize"]), int(block["filters"]), int(block["size"]), int(block["stride"]), bool(block["pad"])
-        
+    try: 
+        batch_norm = int(block["batch_normalize"])
         bias = False
-    
-    # Means no batch_norm so also no bias
     except:
-        batch_norm = False
+        batch_norm = 0
         bias = True
-        filters, size, stride, pad = \
-            int(block["filters"]), int(block["size"]), int(block["stride"]), bool(block["pad"])
+
+    filters, size, stride, pad = \
+        int(block["filters"]), int(block["size"]), int(block["stride"]), bool(block["pad"])
     
     # Note pad is a boolean. If pad == 1 we add padding as described here:
     # https://github.com/pjreddie/darknet/issues/950
@@ -126,7 +123,7 @@ def parse_conv(nr_filters, idx, block):
     
     # Leaky ReLU activation
     if block["activation"] == "leaky":
-        leaky = nn.LeakyReLU(inplace=True)
+        leaky = nn.LeakyReLU(0.1, inplace=True)
         module.add_module("leaky_{0}".format(idx), leaky)
 
     # Return filters to keep track of how many filters we used in this layer
@@ -204,7 +201,7 @@ class Darknet(nn.Module):
             # Forward pass logic for conv and upsample layers
             if module_type == "convolutional" or module_type == "upsample":
                 x = self.module_list[idx](x)
-                outputs[idx] = x
+                #outputs[idx] = x
 
             # Forward pass logic for yolo layer
             elif module_type == "yolo":
@@ -218,14 +215,15 @@ class Darknet(nn.Module):
                 else:
                     detections = torch.cat((detections, x), 1)
                 
-                outputs[idx] = outputs[idx - 1]
+                #outputs[idx] = outputs[idx - 1]
 
             # Forward pass logic for Shortcut, Route layers
             else:
                 self.module_list[idx][0].set_values(outputs, idx)
                 x = self.module_list[idx](x)
-                outputs[idx] = x
-    
+            
+            outputs[idx] = x
+
         return detections
 
 
